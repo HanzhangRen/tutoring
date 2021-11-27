@@ -1,0 +1,1258 @@
+---
+title: "Private Tutoring, High School Enrollment, and the Rural-Urban Education Gap"
+author: "Hanzhang Ren"
+date: "11/26/2021"
+output: word_document
+---
+
+```{r setup, include = F}
+options(kableExtra.auto_format = F)
+library(haven)
+library(tidyverse)
+library(janitor)
+library(arsenal)
+library(scales)
+library(mgcv)
+library(stargazer)
+library(kableExtra)
+```
+
+```{r cleaning}
+# Find children who graduated middle school in 2013/2014.----------------------
+# This function reads and cleans a .dta file.
+set.seed(0)
+read <- function(dta) {
+  read_dta(dta) %>%
+    clean_names()
+}
+child14 <- read("child14.dta")
+wave3_child14 <- filter(child14, (kr1 == 4 | kw404 == 1 | kw1 == 4 |
+  (is.na(kr1) & is.na(kw404) & is.na(kw1) & wf301m == 5)) &
+  cfps2012_latest_r1 == 3)
+
+# Match with CFPS 2012 records.------------------------------------------------
+child12 <- read("child12.dta")
+wave2_child14 <- filter(child12,
+  pid %in% wave3_child14$pid & wd503m >= 0 & urban12 >= 0
+)
+
+# Match with CFPS 2010 records.------------------------------------------------
+child10 <- read("child10.dta")
+wave1_child14 <- filter(child10, pid %in% wave2_child14$pid & ks501 > 0)
+nrow(wave2_child14[wave2_child14$cyear == 2013 & wave2_child14$cmonth == 6 &
+  wave2_child14$pid %in% wave1_child14$pid, ])
+# No June 2013 wave 2
+
+# Get all the data for matched people------------------------------------------
+# A function that determines whether one goes to high school and go to what
+# type of high school for group 1
+high_school_and_type1 <- function(data) {
+  mutate(data,
+    high_school = case_when(kw1 == 3 ~ 0, T ~ 1),
+    high_school_type = case_when(kw501 == 1 | kr4 == 1 ~ 1,
+      kw501 == 2 | kr4 == 2 ~ 2,
+      kw501 == 3 | kr4 == 3 ~ 3,
+      kw501 == 4 | kr4 == 4 ~ 4,
+      kw501 == 5 | kr4 == 5 ~ 5,
+      kw501 == 6 | kr4 == 6 ~ 6
+    )
+  )
+}
+wave3_child14 <- wave3_child14 %>%
+  filter(pid %in% wave1_child14$pid) %>%
+  select(kw1, kw501, kr4, wf312m, pid) %>%
+  high_school_and_type1() %>%
+  rename(key_point = "wf312m") %>%
+  select(-kw1, -kr4, -kw501)
+famecon12 <- read("famecon12.dta")
+famconf12 <- read("famconf12.dta")
+parent <- function(who) {
+  if (length(who) > 1) {
+    if (max(who) > 0) {
+      who <- who[who > 0]
+    } else {
+      who <- -8
+    }
+  }
+  unique(who)
+}
+# This function renames and adds columns for wave 2 data for furthe cleaning
+wave2 <- function(data, urban, male, province) {
+  data %>%
+    rename(
+      urban = all_of(urban),
+      male = all_of(male),
+      province = all_of(province)
+    ) %>%
+    mutate(income = NA, sibship = NA, parent_edu = NA)
+}
+# A function that processes wave 2 data for cohort 1
+wave2_12 <- function(data) {
+  data <- data %>%
+    wave2("urban12", "cfps2012_gender_best", "provcd")
+  for (i in 1:nrow(data)) {
+    earning <- famecon12$fincome2_adj[famecon12$fid12 == data$fid12[i]]
+    if (length(earning) != 0) {
+      data$income[i] <- earning
+    }
+    conf <- famconf12$pid == data$pid[i]
+    mom <- parent(famconf12$pid_m[conf])
+    mom_chd <- famconf12$nchd1[famconf12$pid == mom]
+    if (length(mom_chd) != 0) {
+      if (length(mom_chd) > 1) {
+        mom_chd <- famconf12$nchd1[famconf12$pid == mom &
+          famconf12$cfps_interv_p == 1]
+      }
+      data$sibship[i] <- mom_chd
+    } else {
+      dad <- parent(famconf12$pid_f[conf])
+      dad_chd <- famconf12$nchd1[famconf12$pid == dad]
+      if (length(dad_chd) == 0) {
+        data$sibship[i] <- NA
+      } else {
+        if (length(dad_chd) > 1) {
+          dad_chd <- famconf12$nchd1[famconf12$pid == dad &
+            famconf12$cfps_interv_p == 1]
+        }
+        data$sibship[i] <- dad_chd
+      }
+    }
+    mom_edu <- as.numeric(famconf12$meduc12[conf])
+    dad_edu <- as.numeric(famconf12$feduc12[conf])
+    parents_edu <- max(mom_edu, dad_edu, na.rm = T)
+    if (!is.na(parents_edu) & parents_edu > 0) {
+      data$parent_edu[i] <- parents_edu
+    }
+  }
+  select(data, -fid12)
+}
+wave2_child14 <- wave2_child14 %>%
+  filter(pid %in% wave1_child14$pid) %>%
+  select(urban12, fid12, cfps2012_gender_best, provcd, pid, wd503m, wa4) %>%
+  wave2_12() %>%
+  rename(tutor = "wd503m", hukou = "wa4")
+wave1_child14 <- wave1_child14 %>%
+  select(ks501, pid) %>%
+  rename(academic_satisfaction = "ks501")
+# This function joins three data frames by pid and then deletes the pid
+left_joins <- function(x, y, z) {
+  left_join(x, y, by = "pid") %>%
+    left_join(z, by = "pid")
+}
+group1_child <- left_joins(wave1_child14, wave2_child14, wave3_child14)
+
+# find adults who graduated middle school in 2013/2014-------------------------
+adult14 <- read("adult14.dta")
+wave3_adult14 <- filter(adult14,
+  (kr1 == 4 | kw404 == 1 | kw1 == 4) & cfps2012_latest_r1 == 3
+)
+
+# match with CFPS 2012 records-------------------------------------------------
+adult12 <- read("adult12.dta")
+wave2_adult14_adult12 <- filter(adult12,
+  pid %in% wave3_adult14$pid & ks903 >= 0 & urban12 >= 0
+)
+wave2_adult14_child12 <- filter(child12,
+  pid %in% wave3_adult14$pid & wd503m >= 0 & urban12 >= 0
+)
+
+# match with CFPS 2010 records-------------------------------------------------
+adult10 <- read("adult10.dta")
+wave1_adult14_adult10 <- adult10 %>%
+  filter(pid %in% wave2_adult14_adult12$pid & ks501 > 0)
+wave1_adult14_child10 <- filter(child10,
+  (pid %in% wave2_adult14_adult12$pid | pid %in% wave2_adult14_child12$pid) &
+    ks501 > 0
+)
+# This function checks if anyone in our sample had their Wave 2 data recorded
+# in June 2013.
+check2013 <- function(df) {
+  nrow(df[df$cyear == 2013 & df$cmonth == 6 &
+    (df$pid %in% wave1_adult14_adult10$pid |
+      df$pid %in% wave1_adult14_child10$pid), ])
+}
+check2013(wave2_adult14_adult12)
+check2013(wave2_adult14_child12)
+# no June 2013 wave 2
+
+# get all the data for matched people------------------------------------------
+wave3_adult14 <- wave3_adult14 %>%
+  filter(pid %in% wave1_adult14_adult10$pid |
+    pid %in% wave1_adult14_child10$pid) %>%
+  select(kw1, kr402ma, kr4, kw501, pid) %>%
+  high_school_and_type1() %>%
+  rename(key_point = "kr402ma") %>%
+  select(-kw1, -kr4, -kw501)
+wave2_adult14_adult12 <- wave2_adult14_adult12 %>%
+  filter(pid %in% wave1_adult14_adult10$pid |
+    pid %in% wave1_adult14_child10$pid) %>%
+  select(urban12, fid12, cfps2012_gender_best, provcd, pid, ks903, qa301) %>%
+  wave2_12() %>%
+  rename(tutor = "ks903", hukou = "qa301")
+wave2_adult14_child12 <- wave2_adult14_child12 %>%
+  filter(pid %in% wave1_adult14_adult10$pid |
+    pid %in% wave1_adult14_child10$pid) %>%
+  select(urban12, fid12, cfps2012_gender_best, provcd, pid, wd503m, wa4) %>%
+  wave2_12() %>%
+  rename(tutor = "wd503m", hukou = "wa4")
+wave2_adult14 <- rbind(wave2_adult14_adult12, wave2_adult14_child12)
+wave1_adult14_adult10 <- select(wave1_adult14_adult10, ks501, pid)
+wave1_adult14_child10 <- select(wave1_adult14_child10, ks501, pid)
+wave1_adult14 <- wave1_adult14_adult10 %>%
+  rbind(wave1_adult14_child10) %>%
+  rename(academic_satisfaction = "ks501")
+group1 <- wave1_adult14 %>%
+  left_joins(wave2_adult14, wave3_adult14) %>%
+  rbind(group1_child) %>%
+  mutate(when_tutored = "CFPS10-12")
+
+# find children who graduated middle school in 2015/2016-----------------------
+child16 <- read("child16.dta")
+wave3_child16 <- filter(child16,
+  (pc3_b_2 == 5 | kw404_b_4 == 1 | kw1_b_2 == 5 |
+    (is.na(pc3_b_2) & is.na(kw404_b_4) & is.na(kw1_b_2) & pc3_b_1 == 5) |
+    (is.na(pc3_b_2) & is.na(kw404_b_4) & is.na(kw1_b_2) & kw1_b_1 == 5)) &
+    cfps_latest_r1 == 3
+)
+
+# match with CFPS 2014 records-------------------------------------------------
+wave2_child16 <- filter(child14,
+  pid %in% wave3_child16$pid & wd503m >= 0 & urban14 >= 0
+)
+
+# match with CFPS 2012 records-------------------------------------------------
+wave1_child16 <- filter(child12, pid %in% wave2_child16$pid & ks501 > 0)
+nrow(wave2_child16[wave2_child16$cyear == 2015 & wave2_child16$cmonth == 6 &
+  wave2_child16$pid %in% wave1_child16$pid, ])
+# no June 2015 wave 2
+
+
+# get all the data for matched people------------------------------------------
+wave3_child16 <- wave3_child16 %>%
+  filter(pid %in% wave1_child16$pid) %>%
+  select(school_b_2, school_b_1, kw1_b_2, kw1_b_1, kw501_b_4, kw501_b_1,
+    ps5_b_2, ps5_b_1, ps602_b_2, ps602_b_1, pid
+  ) %>%
+  mutate(
+    high_school = case_when(
+      ((school_b_2 == 0 | (is.na(school_b_2) & school_b_1 == 0)) &
+        (kw1_b_2 == 4 | (is.na(kw1_b_2) & kw1_b_1 == 4))) ~ 0,
+      T ~ 1
+    ),
+    high_school_type_history = case_when(
+      is.na(kw501_b_4) | kw501_b_4 %in% -2:-1 ~ kw501_b_1,
+      T ~ kw501_b_4
+    ),
+    high_school_type = case_when(is.na(ps5_b_2) | ps5_b_2 %in% -2:-1 ~ ps5_b_1,
+      T ~ ps5_b_2
+    ),
+    high_school_type = case_when(
+      high_school_type_history == 1 | high_school_type == 1 ~ 1,
+      high_school_type_history == 2 | high_school_type == 2 ~ 2,
+      high_school_type_history == 3 | high_school_type == 3 ~ 3,
+      high_school_type_history == 4 | high_school_type == 4 ~ 4,
+      high_school_type_history == 5 | high_school_type == 5 ~ 5,
+      high_school_type_history == 6 | high_school_type == 6 ~ 6
+    ),
+    key_point = case_when(is.na(ps602_b_2) | ps602_b_2 %in% -2:-1 ~ ps602_b_1,
+      T ~ ps602_b_2
+    ),
+  ) %>%
+  select(-school_b_2, -school_b_1, -kw1_b_2, -kw1_b_1,
+    -high_school_type_history, -kw501_b_4, -kw501_b_1, -ps5_b_2, -ps5_b_1,
+    -ps602_b_2, -ps602_b_1
+  )
+famecon14 <- read("famecon14.dta")
+# This function determines whether some kind of answer has been provided
+exist <- function(x) {
+  !is.na(x) & x != -8
+}
+famconf14 <- "famconf14.dta" %>%
+  read() %>%
+  mutate(
+    nchd1 = case_when(exist(code_a_c10) | exist(pid_c10) | exist(tb2_a_c10) |
+        exist(tb1y_a_c10) | exist(tb1m_a_c10) | exist(tb1a_a_c10) |
+        exist(tb3_a14_c10) | exist(tb4_a14_c10) | exist(alive_a14_c10) |
+        exist(ta4y_a14_c10) | exist(ta4m_a14_c10) | exist(ta401_a14_c10) |
+        exist(qa301_a14_c10) | exist(qa302_a14_c10) | exist(tb6_a14_c10) |
+        exist(tb601_a14_c10) | exist(co_a14_c10) | exist(outpers_where14_c10) |
+        exist(tb602acode_a14_c10) | exist(cfps2014_interv_c10) ~ 10,
+      exist(code_a_c9) | exist(pid_c9) | exist(tb2_a_c9) | exist(tb1y_a_c9) |
+        exist(tb1m_a_c9) | exist(tb1a_a_c9) | exist(tb3_a14_c9) |
+        exist(tb4_a14_c9) | exist(alive_a14_c9) | exist(ta4y_a14_c9) |
+        exist(ta4m_a14_c9) | exist(ta401_a14_c9) | exist(qa301_a14_c9) |
+        exist(qa302_a14_c9) | exist(tb6_a14_c9) | exist(tb601_a14_c9) |
+        exist(co_a14_c9) | exist(outpers_where14_c9) |
+        exist(tb602acode_a14_c9) | exist(cfps2014_interv_c9) ~ 9,
+      exist(code_a_c8) | exist(pid_c8) | exist(tb2_a_c8) | exist(tb1y_a_c8) |
+        exist(tb1m_a_c8) | exist(tb1a_a_c8) | exist(tb3_a14_c8) |
+        exist(tb4_a14_c8) | exist(alive_a14_c8) | exist(ta4y_a14_c8) |
+        exist(ta4m_a14_c8) | exist(ta401_a14_c8) | exist(qa301_a14_c8) |
+        exist(qa302_a14_c8) | exist(tb6_a14_c8) | exist(tb601_a14_c8) |
+        exist(co_a14_c8) | exist(outpers_where14_c8) |
+        exist(tb602acode_a14_c8) | exist(cfps2014_interv_c8) ~ 8,
+      exist(code_a_c7) | exist(pid_c7) | exist(tb2_a_c7) | exist(tb1y_a_c7) |
+        exist(tb1m_a_c7) | exist(tb1a_a_c7) | exist(tb3_a14_c7) |
+        exist(tb4_a14_c7) | exist(alive_a14_c7) | exist(ta4y_a14_c7) |
+        exist(ta4m_a14_c7) | exist(ta401_a14_c7) | exist(qa301_a14_c7) |
+        exist(qa302_a14_c7) | exist(tb6_a14_c7) | exist(tb601_a14_c7) |
+        exist(co_a14_c7) | exist(outpers_where14_c7) |
+        exist(tb602acode_a14_c7) | exist(cfps2014_interv_c7) ~ 7,
+      exist(code_a_c6) | exist(pid_c6) | exist(tb2_a_c6) | exist(tb1y_a_c6) |
+        exist(tb1m_a_c6) | exist(tb1a_a_c6) | exist(tb3_a14_c6) |
+        exist(tb4_a14_c6) | exist(alive_a14_c6) | exist(ta4y_a14_c6) |
+        exist(ta4m_a14_c6) | exist(ta401_a14_c6) | exist(qa301_a14_c6) |
+        exist(qa302_a14_c6) | exist(tb6_a14_c6) | exist(tb601_a14_c6) |
+        exist(co_a14_c6) | exist(outpers_where14_c6) |
+        exist(tb602acode_a14_c6) | exist(cfps2014_interv_c6) ~ 6,
+      exist(code_a_c5) | exist(pid_c5) | exist(tb2_a_c5) | exist(tb1y_a_c5) |
+        exist(tb1m_a_c5) | exist(tb1a_a_c5) | exist(tb3_a14_c5) |
+        exist(tb4_a14_c5) | exist(alive_a14_c5) | exist(ta4y_a14_c5) |
+        exist(ta4m_a14_c5) | exist(ta401_a14_c5) | exist(qa301_a14_c5) |
+        exist(qa302_a14_c5) | exist(tb6_a14_c5) | exist(tb601_a14_c5) |
+        exist(co_a14_c5) | exist(outpers_where14_c5) |
+        exist(tb602acode_a14_c5) | exist(cfps2014_interv_c5) ~ 5,
+      exist(code_a_c4) | exist(pid_c4) | exist(tb2_a_c4) | exist(tb1y_a_c4) |
+        exist(tb1m_a_c4) | exist(tb1a_a_c4) | exist(tb3_a14_c4) |
+        exist(tb4_a14_c4) | exist(alive_a14_c4) | exist(ta4y_a14_c4) |
+        exist(ta4m_a14_c4) | exist(ta401_a14_c4) | exist(qa301_a14_c4) |
+        exist(qa302_a14_c4) | exist(tb6_a14_c4) | exist(tb601_a14_c4) |
+        exist(co_a14_c4) | exist(outpers_where14_c4) |
+        exist(tb602acode_a14_c4) | exist(cfps2014_interv_c4) ~ 4,
+      exist(code_a_c3) | exist(pid_c3) | exist(tb2_a_c3) | exist(tb1y_a_c3) |
+        exist(tb1m_a_c3) | exist(tb1a_a_c3) | exist(tb3_a14_c3) |
+        exist(tb4_a14_c3) | exist(alive_a14_c3) | exist(ta4y_a14_c3) |
+        exist(ta4m_a14_c3) | exist(ta401_a14_c3) | exist(qa301_a14_c3) |
+        exist(qa302_a14_c3) | exist(tb6_a14_c3) | exist(tb601_a14_c3) |
+        exist(co_a14_c3) | exist(outpers_where14_c3) |
+        exist(tb602acode_a14_c3) | exist(cfps2014_interv_c3) ~ 3,
+      exist(code_a_c2) | exist(pid_c2) | exist(tb2_a_c2) | exist(tb1y_a_c2) |
+        exist(tb1m_a_c2) | exist(tb1a_a_c2) | exist(tb3_a14_c2) |
+        exist(tb4_a14_c2) | exist(alive_a14_c2) | exist(ta4y_a14_c2) |
+        exist(ta4m_a14_c2) | exist(ta401_a14_c2) | exist(qa301_a14_c2) |
+        exist(qa302_a14_c2) | exist(tb6_a14_c2) | exist(tb601_a14_c2) |
+        exist(co_a14_c2) | exist(outpers_where14_c2) |
+        exist(tb602acode_a14_c2) | exist(cfps2014_interv_c2) ~ 2,
+      exist(code_a_c1) | exist(pid_c1) | exist(tb2_a_c1) | exist(tb1y_a_c1) |
+        exist(tb1m_a_c1) | exist(tb1a_a_c1) | exist(tb3_a14_c1) |
+        exist(tb4_a14_c1) | exist(alive_a14_c1) | exist(ta4y_a14_c1) |
+        exist(ta4m_a14_c1) | exist(ta401_a14_c1) | exist(qa301_a14_c1) |
+        exist(qa302_a14_c1) | exist(tb6_a14_c1) | exist(tb601_a14_c1) |
+        exist(co_a14_c1) | exist(outpers_where14_c1) |
+        exist(tb602acode_a14_c1) | exist(cfps2014_interv_c1) ~ 1,
+      T ~ 0
+    ),
+    meduc14 = case_when(tb4_a14_m != 9 ~ tb4_a14_m),
+    feduc14 = case_when(tb4_a14_f != 9 ~ tb4_a14_f)
+  )
+# This functioon processes Wave 2 data for Cohort 2
+wave2_14 <- function(data) {
+  data <- data %>%
+    wave2("urban14", "cfps_gender", "provcd14")
+  for (i in 1:nrow(data)) {
+    earning <- famecon14$fincome2[famecon14$fid14 == data$fid14[i]]
+    if (length(earning) != 0) {
+      data$income[i] <- earning
+    }
+    mom <- parent(famconf14$pid_m[famconf14$pid == data$pid[i]])
+    mom_chd <- famconf14$nchd1[famconf14$pid == mom]
+    if (length(mom_chd) != 0) {
+      if (length(mom_chd) > 1) {
+        mom_chd <- famconf14$nchd1[famconf14$pid == mom &
+          famconf14$tb6_a14_p == 1]
+      }
+      data$sibship[i] <- mom_chd
+    } else {
+      dad <- parent(famconf14$pid_f[famconf14$pid == data$pid[i]])
+      dad_chd <- famconf14$nchd1[famconf14$pid == dad]
+      if (length(dad_chd) == 0) {
+        data$sibship[i] <- NA
+      } else {
+        if (length(dad_chd) > 1) {
+          dad_chd <- famconf14$nchd1[famconf14$pid == dad &
+            famconf14$tb6_a14_p == 1]
+        }
+        data$sibship[i] <- dad_chd
+      }
+    }
+    mom_edu <- as.numeric(famconf14$meduc14[famconf14$pid == data$pid[i]])
+    dad_edu <- as.numeric(famconf14$feduc14[famconf14$pid == data$pid[i]])
+    parents_edu <- max(mom_edu, dad_edu, na.rm = T)
+    if (!is.na(parents_edu) & parents_edu > 0) {
+      data$parent_edu[i] <- parents_edu
+    }
+  }
+  select(data, -fid14)
+}
+wave2_child16 <- wave2_child16 %>%
+  filter(pid %in% wave1_child16$pid) %>%
+  select(wd503m, wa4, urban14, cfps_gender, provcd14, fid14, pid) %>%
+  wave2_14() %>%
+  rename(tutor = "wd503m", hukou = "wa4")
+wave1_child16 <- wave1_child16 %>%
+  select(ks501, pid) %>%
+  rename(academic_satisfaction = "ks501")
+group2_child <- left_joins(wave1_child16, wave2_child16, wave3_child16)
+
+# find adults who graduated middle school in 2015/2016------------------------------
+adult16 <- read("adult16.dta")
+wave3_adult16 <- filter(adult16,
+  (pc3 == 5 | kw401_b_1 == 1 | kw1 == 5) & cfps_latest_r1 == 3
+)
+
+# match with CFPS 2014 records-------------------------------------------------
+wave2_adult16_adult14 <- filter(adult14,
+  pid %in% wave3_adult16$pid & ks903 >= 0 & urban14 >= 0
+)
+wave2_adult16_child14 <- filter(child14,
+  pid %in% wave3_adult16$pid & wd503m >= 0 & urban14 >= 0
+)
+
+# match with CFPS 2012 records-------------------------------------------------
+wave1_adult16_adult12 <- filter(adult12,
+  pid %in% wave2_adult16_adult14$pid & ks501 > 0
+)
+wave1_adult16_child12 <- filter(child12,
+  (pid %in% wave2_adult16_adult14$pid | pid %in% wave2_adult16_child14$pid) &
+    ks501 > 0
+)
+check2015 <- function(df) {
+  nrow(df[df$cyear == 2015 & df$cmonth == 6 &
+    (df$pid %in% wave1_adult14_adult10$pid |
+      df$pid %in% wave1_adult14_child10$pid), ])
+}
+# This function checks if anyone in our sample had their Wave 2 data recorded
+# in June 2015.
+check2015(wave2_adult16_adult14)
+check2015(wave2_adult16_child14)
+# no June 2015 wave 2
+
+
+# get all the data for matched sample------------------------------------------
+wave3_adult16 <- wave3_adult16 %>%
+  filter(pid %in% wave1_adult16_adult12$pid |
+    pid %in% wave1_adult16_child12$pid) %>%
+  select(school, kw1, kw501_b_1, ps5, ps602, pid) %>%
+  mutate(
+    high_school = case_when(school == 0 & kw1 == 4 ~ 0, T ~ 1),
+    high_school_type = case_when(kw501_b_1 == 1 | ps5 == 1 ~ 1,
+      kw501_b_1 == 2 | ps5 == 2 ~ 2,
+      kw501_b_1 == 3 | ps5 == 3 ~ 3,
+      kw501_b_1 == 4 | ps5 == 4 ~ 4,
+      kw501_b_1 == 5 | ps5 == 5 ~ 5,
+      kw501_b_1 == 6 | ps5 == 6 ~ 6
+    )
+  ) %>%
+  rename(key_point = "ps602") %>%
+  select(-school, -kw1, -kw501_b_1, -ps5)
+wave2_adult16_adult14 <- wave2_adult16_adult14 %>%
+  filter(pid %in% wave1_adult16_adult12$pid |
+    pid %in% wave1_adult16_child12$pid) %>%
+  select(ks903, qa301, urban14, cfps_gender, provcd14, fid14, pid) %>%
+  wave2_14() %>%
+  rename(tutor = "ks903", hukou = "qa301")
+wave2_adult16_child14 <- wave2_adult16_child14 %>%
+  filter(pid %in% wave1_adult16_adult12$pid |
+    pid %in% wave1_adult16_child12$pid) %>%
+  select(wd503m, wa4, urban14, cfps_gender, provcd14, fid14, pid) %>%
+  wave2_14() %>%
+  rename(tutor = "wd503m", hukou = "wa4")
+wave2_adult16 <- rbind(wave2_adult16_adult14, wave2_adult16_child14)
+wave1_adult16_adult12 <- select(wave1_adult16_adult12, ks501, pid)
+wave1_adult16_child12 <- select(wave1_adult16_child12, ks501, pid)
+wave1_adult16 <- wave1_adult16_adult12 %>%
+  rbind(wave1_adult16_child12) %>%
+  rename(academic_satisfaction = "ks501")
+group2 <- wave1_adult16 %>%
+  left_joins(wave2_adult16, wave3_adult16) %>%
+  rbind(group2_child) %>%
+  mutate(when_tutored = "CFPS12-14")
+
+# find people who graduated middle school in 2017------------------------------
+wave3_childproxy18 <- read("childproxy18.dta")
+wave3_person18 <- "person18.dta" %>%
+  read() %>%
+  mutate(wc3_b_2 = NA, ws5 = NA, ws602 = NA)
+for (i in 1:nrow(wave3_childproxy18)) {
+  wave3_person18$wc3_b_2[wave3_person18$pid == wave3_childproxy18$pid[i]] <-
+    wave3_childproxy18$wc3_b_2[i]
+  wave3_person18$ws5[wave3_person18$pid == wave3_childproxy18$pid[i]] <-
+    wave3_childproxy18$ws5[i]
+  wave3_person18$ws602[wave3_person18$pid == wave3_childproxy18$pid[i]] <-
+    wave3_childproxy18$ws602[i]
+}
+wave3_person18 <- filter(wave3_person18,
+  (qc3 == 5 | kw1004_b_2 == 1 | kw1_s_1 == 5 |
+    (is.na(qc3) & is.na(kw1004_b_2) & is.na(kw1_s_1) & wc3_b_2 > 4)) &
+    r1_last == 4
+)
+
+# match with CFPS 2016 records-------------------------------------------------
+wave2_person18_adult16 <- filter(adult16,
+  pid %in% wave3_person18$pid & pd503r >= 0 & urban16 >= 0
+)
+wave2_person18_child16 <- filter(child16,
+  pid %in% wave3_person18$pid & pd503r >= 0 & urban16 >= 0
+)
+
+# match with CFPS 2014 records-------------------------------------------------
+wave1_person18_adult14 <- filter(adult14,
+  pid %in% wave2_person18_adult16$pid & ks501 > 0
+)
+wave1_person18_child14 <- filter(child14,
+  (pid %in% wave2_person18_adult16$pid |
+    pid %in% wave2_person18_child16$pid) & ks501 > 0
+)
+check <- wave2_person18_child16[wave2_person18_child16$self_cyear == 2017 &
+  wave2_person18_child16$self_cmonth == 6 &
+  (wave2_person18_child16$pid %in% wave1_person18_adult14$pid |
+    wave2_person18_child16$pid %in% wave1_person18_child14$pid), ]
+check$pid
+nrow(wave2_person18_child16[wave2_person18_child16$proxy_cyear == 2017 &
+  wave2_person18_child16$proxy_cmonth == 6 &
+  (wave2_person18_child16$pid %in% wave1_person18_adult14$pid |
+    wave2_person18_child16$pid %in% wave1_person18_child14$pid), ])
+# No Jun 2017 wave 2 interviews
+
+# get all data for matched sample----------------------------------------------
+wave3_person18 <- wave3_person18 %>%
+  filter(pid %in% wave2_person18_adult16$pid |
+    pid %in% wave2_person18_child16$pid) %>%
+  select(school, kw1_s_1, kw501_b_1, qs5, ws5, qs602, ws602, pid) %>%
+  mutate(
+    qs5 = as.numeric(qs5),
+    ws5 = as.numeric(ws5),
+    qs602 = as.numeric(qs602),
+    high_school = case_when(school == 0 & kw1_s_1 == 4 ~ 0, T ~ 1),
+    high_school_type = case_when(is.na(qs5) | qs5 %in% -2:-1 ~ ws5, T ~ qs5),
+    high_school_type = case_when(kw501_b_1 == 1 | high_school_type == 1 ~ 1,
+      kw501_b_1 == 2 | high_school_type == 2 ~ 2,
+      kw501_b_1 == 3 | high_school_type == 3 ~ 3,
+      kw501_b_1 == 4 | high_school_type == 4 ~ 4,
+      kw501_b_1 == 5 | high_school_type == 5 ~ 5,
+      kw501_b_1 == 6 | high_school_type == 6 ~ 6
+    ),
+    key_point = case_when(is.na(qs602) | qs602 %in% -2:-1 ~ ws602, T ~ qs602),
+  ) %>%
+  select(-school, -kw1_s_1, -kw501_b_1, -qs5, -ws5, -qs602, -ws602)
+famconf16 <- "famconf16.dta" %>%
+  read() %>%
+  mutate(nchd1 = case_when(exist(code_a_c10) | exist(pid_c10) |
+      exist(co_a16_c10) | exist(tb6_a16_c10) | exist(tb2_a_c10) |
+      exist(tb1y_a_c10) | exist(tb1m_a_c10) | exist(tb1a_a_c10) |
+      exist(tb3_a16_c10) | exist(tb4_a16_c10) | exist(alive_a16_c10) |
+      exist(ta4y_a16_c10) | exist(ta4m_a16_c10) | exist(ta401_a16_c10) |
+      exist(hukou_a16_c10) | exist(tb601_a16_c10) |
+      exist(outpers_where16_c10) | exist(tb602acode_a16_c10) |
+      exist(cfps2016_interv_c10) ~ 10,
+    exist(code_a_c9) | exist(pid_c9) | exist(co_a16_c9) | exist(tb6_a16_c9) |
+      exist(tb2_a_c9) | exist(tb1y_a_c9) | exist(tb1m_a_c9) |
+      exist(tb1a_a_c9) | exist(tb3_a16_c9) | exist(tb4_a16_c9) |
+      exist(alive_a16_c9) | exist(ta4y_a16_c9) | exist(ta4m_a16_c9) |
+      exist(ta401_a16_c9) | exist(hukou_a16_c9) | exist(tb601_a16_c9) |
+      exist(outpers_where16_c9) | exist(tb602acode_a16_c9) |
+      exist(cfps2016_interv_c9) ~ 9,
+    exist(code_a_c8) | exist(pid_c8) | exist(co_a16_c8) | exist(tb6_a16_c8) |
+      exist(tb2_a_c8) | exist(tb1y_a_c8) | exist(tb1m_a_c8) |
+      exist(tb1a_a_c8) | exist(tb3_a16_c8) | exist(tb4_a16_c8) |
+      exist(alive_a16_c8) | exist(ta4y_a16_c8) | exist(ta4m_a16_c8) |
+      exist(ta401_a16_c8) | exist(hukou_a16_c8) | exist(tb601_a16_c8) |
+      exist(outpers_where16_c8) | exist(tb602acode_a16_c8) |
+      exist(cfps2016_interv_c8) ~ 8,
+    exist(code_a_c7) | exist(pid_c7) | exist(co_a16_c7) | exist(tb6_a16_c7) |
+      exist(tb2_a_c7) | exist(tb1y_a_c7) | exist(tb1m_a_c7) |
+      exist(tb1a_a_c7) | exist(tb3_a16_c7) | exist(tb4_a16_c7) |
+      exist(alive_a16_c7) | exist(ta4y_a16_c7) | exist(ta4m_a16_c7) |
+      exist(ta401_a16_c7) | exist(hukou_a16_c7) | exist(tb601_a16_c7) |
+      exist(outpers_where16_c7) | exist(tb602acode_a16_c7) |
+      exist(cfps2016_interv_c7) ~ 7,
+    exist(code_a_c6) | exist(pid_c6) | exist(co_a16_c6) | exist(tb6_a16_c6) |
+      exist(tb2_a_c6) | exist(tb1y_a_c6) | exist(tb1m_a_c6) |
+      exist(tb1a_a_c6) | exist(tb3_a16_c6) | exist(tb4_a16_c6) |
+      exist(alive_a16_c6) | exist(ta4y_a16_c6) | exist(ta4m_a16_c6) |
+      exist(ta401_a16_c6) | exist(hukou_a16_c6) | exist(tb601_a16_c6) |
+      exist(outpers_where16_c6) | exist(tb602acode_a16_c6) |
+      exist(cfps2016_interv_c6) ~ 6,
+    exist(code_a_c5) | exist(pid_c5) | exist(co_a16_c5) | exist(tb6_a16_c5) |
+      exist(tb2_a_c5) | exist(tb1y_a_c5) | exist(tb1m_a_c5) |
+      exist(tb1a_a_c5) | exist(tb3_a16_c5) | exist(tb4_a16_c5) |
+      exist(alive_a16_c5) | exist(ta4y_a16_c5) | exist(ta4m_a16_c5) |
+      exist(ta401_a16_c5) | exist(hukou_a16_c5) | exist(tb601_a16_c5) |
+      exist(outpers_where16_c5) | exist(tb602acode_a16_c5) |
+      exist(cfps2016_interv_c5) ~ 5,
+    exist(code_a_c4) | exist(pid_c4) | exist(co_a16_c4) | exist(tb6_a16_c4) |
+      exist(tb2_a_c4) | exist(tb1y_a_c4) | exist(tb1m_a_c4) |
+      exist(tb1a_a_c4) | exist(tb3_a16_c4) | exist(tb4_a16_c4) |
+      exist(alive_a16_c4) | exist(ta4y_a16_c4) | exist(ta4m_a16_c4) |
+      exist(ta401_a16_c4) | exist(hukou_a16_c4) | exist(tb601_a16_c4) |
+      exist(outpers_where16_c4) | exist(tb602acode_a16_c4) |
+      exist(cfps2016_interv_c4) ~ 4,
+    exist(code_a_c3) | exist(pid_c3) | exist(co_a16_c3) | exist(tb6_a16_c3) |
+      exist(tb2_a_c3) | exist(tb1y_a_c3) | exist(tb1m_a_c3) |
+      exist(tb1a_a_c3) | exist(tb3_a16_c3) | exist(tb4_a16_c3) |
+      exist(alive_a16_c3) | exist(ta4y_a16_c3) | exist(ta4m_a16_c3) |
+      exist(ta401_a16_c3) | exist(hukou_a16_c3) | exist(tb601_a16_c3) |
+      exist(outpers_where16_c3) | exist(tb602acode_a16_c3) |
+      exist(cfps2016_interv_c3) ~ 3,
+    exist(code_a_c2) | exist(pid_c2) | exist(co_a16_c2) | exist(tb6_a16_c2) |
+      exist(tb2_a_c2) | exist(tb1y_a_c2) | exist(tb1m_a_c2) |
+      exist(tb1a_a_c2) | exist(tb3_a16_c2) | exist(tb4_a16_c2) |
+      exist(alive_a16_c2) | exist(ta4y_a16_c2) | exist(ta4m_a16_c2) |
+      exist(ta401_a16_c2) | exist(hukou_a16_c2) | exist(tb601_a16_c2) |
+      exist(outpers_where16_c2) | exist(tb602acode_a16_c2) |
+      exist(cfps2016_interv_c2) ~ 2,
+    exist(code_a_c1) | exist(pid_c1) | exist(co_a16_c1) | exist(tb6_a16_c1) |
+      exist(tb2_a_c1) | exist(tb1y_a_c1) | exist(tb1m_a_c1) |
+      exist(tb1a_a_c1) | exist(tb3_a16_c1) | exist(tb4_a16_c1) |
+      exist(alive_a16_c1) | exist(ta4y_a16_c1) | exist(ta4m_a16_c1) |
+      exist(ta401_a16_c1) | exist(hukou_a16_c1) | exist(tb601_a16_c1) |
+      exist(outpers_where16_c1) | exist(tb602acode_a16_c1) |
+      exist(cfps2016_interv_c1) ~ 1,
+    T ~ 0
+  ))
+famecon16 <- read("famecon16.dta")
+wave2_16 <- function(data) {
+  data <- data %>%
+    filter(pid %in% wave2_person18_adult16$pid |
+      pid %in% wave2_person18_child16$pid) %>%
+    select(pd503r, pa301, urban16, cfps_gender, provcd16, fid16, pid) %>%
+    rename(
+      urban = "urban16",
+      male = "cfps_gender",
+      province = "provcd16",
+      tutor = "pd503r",
+      hukou = "pa301"
+    ) %>%
+    mutate(income = NA, sibship = NA, parent_edu = NA)
+  for (i in 1:nrow(data)) {
+    earning <- famecon16$fincome2[famecon16$fid16 == data$fid16[i]]
+    if (length(earning) != 0) {
+      data$income[i] <- earning
+    }
+    mom <- famconf16$pid_m[famconf16$pid == data$pid[i]] %>%
+      parent()
+    mom_chd <- famconf16$nchd1[famconf16$pid == mom]
+    if (length(mom_chd) != 0) {
+      if (length(mom_chd) > 1) {
+        mom_chd <- famconf16$nchd1[famconf16$pid == mom &
+          famconf16$tb6_a16_p == 1]
+      }
+      data$sibship[i] <- mom_chd
+    } else {
+      dad <- famconf16$pid_f[famconf16$pid == data$pid[i]] %>%
+        parent()
+      dad_chd <- famconf16$nchd1[famconf16$pid == dad]
+      if (length(dad_chd) == 0) {
+        data$sibship[i] <- NA
+      } else {
+        if (length(dad_chd) > 1) {
+          dad_chd <- famconf16$nchd1[famconf16$pid == dad &
+            famconf16$tb6_a16_p == 1]
+        }
+        data$sibship[i] <- dad_chd
+      }
+    }
+    mom_edu <- as.numeric(famconf16$tb4_a16_m[famconf16$pid == data$pid[i]])
+    dad_edu <- as.numeric(famconf16$tb4_a16_f[famconf16$pid == data$pid[i]])
+    parents_edu <- max(mom_edu, dad_edu, na.rm = T)
+    if (!is.na(parents_edu) & parents_edu > 0) {
+      data$parent_edu[i] <- parents_edu
+    }
+  }
+  select(data, -fid16)
+}
+wave2_person18_adult16 <- wave2_16(wave2_person18_adult16)
+wave2_person18_child16 <- wave2_16(wave2_person18_child16)
+wave2_person18 <- rbind(wave2_person18_adult16, wave2_person18_child16)
+wave1_person18_adult14 <- select(wave1_person18_adult14, ks501, pid)
+wave1_person18_child14 <- select(wave1_person18_child14, ks501, pid)
+wave1_person18 <- wave1_person18_adult14 %>%
+  rbind(wave1_person18_child14) %>%
+  rename(academic_satisfaction = "ks501")
+group3 <- wave1_person18 %>%
+  left_joins(wave2_person18, wave3_person18) %>%
+  mutate(when_tutored = "CFPS14-16")
+
+# Final Cleanup----------------------------------------------------------------
+weights <- rbind(
+  select(child10, pid, rswt_nat),
+  select(adult10, pid, rswt_nat)
+)
+cfps <- rbind(group1, group2, group3) %>%
+  mutate(
+    high_school = ifelse(high_school == 0, "No", "Yes"),
+    high_school_num = as.numeric(high_school == "Yes"),
+    academic_high = case_when(
+      high_school == "No" ~ "No", high_school_type > 1 ~ "No",
+      high_school_type == 1 ~ "Yes",
+    ),
+    academic_high_num = as.numeric(academic_high == "Yes"),
+    key_point = as.numeric(key_point),
+    key_point = case_when(
+      high_school == "No" ~ "No", key_point == 0 ~ "No", key_point == 5 ~ "No",
+      key_point == 1 ~ "Yes"
+    ),
+    key_point_num = as.numeric(key_point == "Yes"),
+    log_tutor = log(tutor + 1),
+    tutor000 = tutor / 1000,
+    residence = ifelse(urban == 0, "Rural", "Urban"),
+    academic_satisfaction = as.numeric(academic_satisfaction),
+    academic_satisfaction = case_when(academic_satisfaction %in% 1:2 ~ "1/2",
+      T ~ as.character(academic_satisfaction)),
+    female = ifelse(male == 0, "Yes", "No"),
+    log_income = log(income),
+    log_income = case_when(is.na(log_income) ~ mean(log_income, na.rm = T),
+      T ~ log_income
+    ),
+    income000 = exp(log_income) / 1000,
+    parent_edu = case_when(
+      parent_edu == 1 ~ "Illiterate/Semi-literate",
+      parent_edu == 2 ~ "Elementary School",
+      parent_edu == 3 ~ "Middle School",
+      parent_edu == 4 ~ "High School",
+      parent_edu > 4 ~ "College or Above"
+    ),
+    sibship = case_when(is.na(sibship) ~ mean(sibship, na.rm = T),T ~ sibship),
+    region = case_when(
+      province %in% c(11:13, 21, 31:33, 35, 37, 44, 46) ~ "Eastern",
+      province %in% c(14, 22:23, 34, 36, 41:43) ~ "Central",
+      T ~ "Western"
+    ),
+    region = factor(region, levels = c("Eastern", "Central", "Western")),
+    rural_hukou = case_when(hukou == 1 ~ "Yes",
+      hukou == 3 ~ "No", hukou == 79 ~ "No"
+    ),
+    when_tutored = factor(when_tutored),
+    interaction = log_tutor * as.numeric(residence == "Rural")
+  ) %>%
+  select(-urban, -income, -hukou, -male, -province, -high_school_type) %>%
+  merge(weights, "pid", all.x = T) %>%
+  rename(wt = "rswt_nat") %>% 
+  select(-pid)
+table(cfps$parent_edu)
+table(cfps$rural_hukou)
+cfps <- mutate(cfps,
+  parent_edu = case_when(is.na(parent_edu) ~ "Middle School", T ~ parent_edu),
+  parent_edu = factor(parent_edu,
+      levels = c("Illiterate/Semi-literate",
+        "Elementary School",
+        "Middle School",
+        "High School",
+        "College or Above"
+      )
+    ),
+  rural_hukou = case_when(is.na(rural_hukou) ~ "Yes", T ~ rural_hukou)
+)
+```
+
+```{r table1, results = "asis"}
+# Create Table 1
+labels(cfps) <- c(
+  high_school = "High School",
+  academic_high = "Academic High School",
+  key_point = "Key-Point High School",
+  academic_satisfaction = "Earlier Academic Satisfaction",
+  tutor000 = "Tutoring (Thousand RMB)",
+  female = "Female",
+  income000 = "Income (Thousand RMB)",
+  parent_edu = "Highest Parent Education",
+  sibship = "Sibship",
+  region = "Region",
+  rural_hukou = "Rural Hukou",
+  when_tutored = "When Tutored"
+)
+summary(tableby(residence ~ tutor000 + high_school + academic_high +
+  key_point + academic_satisfaction + female + income000 + parent_edu + 
+  sibship + region + rural_hukou + when_tutored,
+data = cfps,
+cat.stats = "countpct", cat.simplify = T,
+numeric.stats = "meansd", numeric.simplify = T, numeric.test = "kwt",
+digits = 2
+),
+title = "Table 1. Summary Statistics by Residence",
+pfootnote = T
+)
+```
+
+```{r table1_extra}
+# Some more numbers to mention in the paper
+mean(cfps$tutor[cfps$residence == "Urban"]) /
+  mean(cfps$tutor[cfps$residence == "Rural"])
+length(cfps$tutor[cfps$tutor > 0 & cfps$residence == "Rural"]) /
+  length(cfps$tutor[cfps$residence == "Rural"])
+length(cfps$tutor[cfps$tutor > 0 & cfps$residence == "Urban"]) /
+  length(cfps$tutor[cfps$residence == "Urban"])
+```
+
+```{r figure1, dpi = 300}
+# Make density plots of private tutoring spending
+density1 <- cfps %>%
+  mutate(
+    Enrolled = high_school,
+    facet = ifelse(residence == "Rural", "HS, Rural", "HS, Urban")
+  )
+density2 <- cfps %>%
+  mutate(
+    Enrolled = academic_high,
+    facet = ifelse(residence == "Rural",
+      "Academic HS, Rural", "Academic HS, Urban"
+    )
+  )
+density3 <- cfps %>%
+  mutate(
+    Enrolled = key_point,
+    facet = ifelse(residence == "Rural",
+      "Key-point HS, Rural", "Key-point HS, Urban"
+    )
+  )
+density <- rbind(density1, density2, density3)
+density$facet <- factor(density$facet,
+  levels = c("HS, Rural", "Academic HS, Rural", "Key-point HS, Rural",
+    "HS, Urban", "Academic HS, Urban", "Key-point HS, Urban"
+  )
+)
+ggplot(
+  density[!is.na(density$Enrolled), ], aes(x = tutor, color = Enrolled)
+) + geom_density() + facet_wrap(vars(facet)) +
+  labs(
+    x = "Tutoring (¥)", y = "Density",
+    title = "Figure 1. Tutoring and High School (HS) Enrollment",
+    caption = "¥ is log(x+1) transformed"
+  ) +
+  scale_x_continuous(breaks = c(0, 10, 100, 1000, 10000), trans = "log1p") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r table2, results = F}
+# Make regression table
+cfps$residence <- factor(cfps$residence, levels = c("Urban", "Rural"))
+# This function runs a logistic gam on the cfps data
+gam_cfps <- function(formula) {
+  gam(formula, family = "binomial", data = cfps)
+}
+gam1 <- gam_cfps(high_school_num ~ s(log_tutor) + academic_satisfaction)
+gam1_summary <- summary(gam1)
+gam2 <- gam_cfps(high_school_num ~ s(log_tutor) + residence + 
+  academic_satisfaction + female + log_income + parent_edu + sibship + region + 
+  rural_hukou + when_tutored)
+gam2_summary <- summary(gam2)
+gam3 <- gam_cfps(high_school_num ~ s(log_tutor) + residence + 
+  academic_satisfaction + female + log_income + parent_edu + sibship + region + 
+  rural_hukou + when_tutored + s(interaction)
+)
+gam3_summary <- summary(gam3)
+gam4 <- gam_cfps(academic_high_num ~ s(log_tutor) + academic_satisfaction)
+gam4_summary <- summary(gam4)
+gam5 <- gam_cfps(academic_high_num ~ s(log_tutor) + residence + 
+  academic_satisfaction + female + log_income + parent_edu + sibship + region + 
+  rural_hukou + when_tutored
+)
+gam5_summary <- summary(gam5)
+gam6 <- gam_cfps(academic_high_num ~ s(log_tutor) + residence + 
+  academic_satisfaction + female + log_income + parent_edu + sibship + region + 
+  rural_hukou + when_tutored + s(interaction)
+)
+gam6_summary <- summary(gam6)
+gam7 <- gam_cfps(key_point_num ~ s(log_tutor) + academic_satisfaction)
+gam7_summary <- summary(gam7)
+gam8 <- gam_cfps(key_point_num ~ s(log_tutor) + residence + 
+  academic_satisfaction + female + log_income + parent_edu + sibship + region + 
+  rural_hukou + when_tutored
+)
+gam8_summary <- summary(gam8)
+gam9 <- gam_cfps(key_point_num ~ s(log_tutor) + residence + 
+  academic_satisfaction + female + log_income + parent_edu + sibship + region + 
+  rural_hukou + when_tutored + s(interaction)
+)
+gam9_summary <- summary(gam9)
+# This function adds stars to a p-value
+star <- function(summary, k) {
+  case_when(summary$s.pv[k] < 0.001 ~ "< 0.001***",
+    summary$s.pv[k] < 0.01 ~ paste0(round(summary$s.pv[k], 3), "**"),
+    summary$s.pv[k] < 0.05 ~ paste0(round(summary$s.pv[k], 3), "*"),
+    T ~ paste0(round(summary$s.pv[k], 3))
+  )
+}
+stargazer(gam1, gam2, gam3, gam4, gam5, gam6, gam7, gam8, gam9,
+  title = "Table 2. General Additive Models for High School Outcomes",
+  style = "asr",
+  out = "cfps.html",
+  covariate.labels = c("Rural Residence",
+    "Earlier Academic Satisfaction 3 (vs 1/2)",
+    "------------------------------------4",
+    "------------------------------------5",
+    "Female",
+    "Income (¥)",
+    "Parent Edu.: Elementary School (vs Semi-literate or Below)",
+    "----------------Middle School",
+    "----------------High School",
+    "----------------College or Above",
+    "Sibship",
+    "Region: Central (vs. Eastern)",
+    "----------Western",
+    "Rural Hukou",
+    "When Tutored: CFPS12-14 (vs 10-12)",
+    "-------------------CFPS14-16"
+  ),
+  dep.var.labels = c(
+    "High School", "Academic High School", "Key-point High School"
+  ),
+  add.lines = list(c("Tutoring (¥): Smooth Term p-value",
+      star(gam1_summary, 1), star(gam2_summary, 1), star(gam3_summary, 1),
+      star(gam4_summary, 1), star(gam5_summary, 1), star(gam6_summary, 1),
+      star(gam7_summary, 1), star(gam8_summary, 1), star(gam9_summary, 1)
+    ),
+    c("Tutoring (¥) * Rural Residence: Smooth Term p-value",
+      "", "", star(gam3_summary, 2),
+      "", "", star(gam6_summary, 2),
+      "", "", star(gam9_summary, 2)
+    )
+  ),
+  omit = c("log_tutor", "interaction"),
+  notes = paste("Tutoring spending is log(x+1) transformed.",
+    "Income is log transformed."
+  ),
+  notes.append = T,
+  no.space = T
+)
+```
+
+```{r figure2, dpi = 300}
+# Prepare for the plotting of partial effects for Models 1,2,4,5,7,8
+# Create a fake dataset where individuals differ only in terms of log_tutor,
+# The log_tutor covers a range, so we can plot the partial effects
+fake <- data.frame(
+  log_tutor = 0,
+  residence = "Urban",
+  academic_satisfaction = "1/2",
+  female = "No",
+  log_income = 0,
+  parent_edu = "Illiterate/Semi-literate",
+  sibship = 0,
+  region = "Eastern",
+  rural_hukou = "No",
+  when_tutored = "CFPS10-12",
+  interaction = 0
+)
+xs_cfps <- plot(gam2)[[1]][["x"]]
+fake100 <- mutate(fake[rep(1, 100), ], log_tutor = xs_cfps)
+# Simulate the creation of different models based on bootstrapped samples,
+# and then make predictions for the value of a specified term in the formula
+sim_bs <- function(model, data, term) {
+  prediction <- model %>%
+    predict(newdata = data, type = "lpmatrix") %>%
+    data.frame()
+  names <- colnames(prediction)
+  prediction <- select(prediction, contains(term))
+  normal <- rmvn(10000, coef(model), model$Vp) %>%
+    data.frame()
+  colnames(normal) <- names
+  normal <- select(normal, contains(term))
+  tcrossprod(as.matrix(normal), as.matrix(prediction))
+}
+
+# This function subtract the bootstrapped partial effects when spending is zero
+# from the the bootstrapped partial effects for other levels of spending,
+# allowing one to estimate the uncertainties associated with partial effect of
+# spending an amount of money as compared to spending zero
+band <- function(data) {
+  data <- data - data[, 1]
+  mean <- colMeans(data)
+  # This function calculates the margins of a confidence band
+  margin <- function(probs) {
+    apply(data, 2, function(x) quantile(x, probs = probs))
+  }
+  list(mean, margin(.025), margin(.975))
+}
+x_tck <- c(0, 10, 100, 1000, 10000, 100000)
+# This function plots some horizontal feaures that are unchanged in each graph
+axes <- function(xs, y_tck) {
+  abline(h = 0, lty = 3)
+  axis(1, at = log1p(x_tck), x_tck, cex.axis = 0.6)
+  axis(1, at = xs, tck = 0.05, labels = F)
+  axis(2, at = log(y_tck), y_tck, cex.axis = 0.6)
+}
+# This function plots a partial effect graph
+plots <- function(model, data, term, xlab, ylab, ylim, xs, y_tck) {
+  band <- sim_bs(model, data, term) %>%
+    band()
+  plot(xs_cfps, band[[1]],
+    type = "l",
+    xlab = xlab, ylab = ylab,
+    xaxt = "n", yaxt = "n",
+    ylim = ylim
+  )
+  lines(xs_cfps, band[[2]], type = "l", lty = 2)
+  lines(xs_cfps, band[[3]], type = "l", lty = 2)
+  axes(xs, y_tck)
+}
+y_tck1 <- c(0.1, 1, 10, 100, 1000)
+par(mfcol = c(2, 3))
+plots(gam1, fake100, "s.", "Model 1", "HS", c(-2, 8), cfps$log_tutor, y_tck1)
+plots(gam2, fake100, "s.", "Model 2", "HS", c(-2, 8), cfps$log_tutor, y_tck1)
+plots(gam4, fake100, "s.", "Model 4", "Academic HS",
+  c(-2, 8), cfps$log_tutor[!is.na(cfps$academic_high)], y_tck1
+)
+plots(gam5, fake100, "s.", "Model 5", "Academic HS",
+  c(-2, 8), cfps$log_tutor[!is.na(cfps$academic_high)], y_tck1
+)
+plots(gam7, fake100, "s.", "Model 7", "Key-point HS",
+  c(-2, 8), cfps$log_tutor[!is.na(cfps$key_point)], y_tck1
+)
+plots(gam8, fake100, "s.", "Model 8", "Key-point HS",
+  c(-2, 8), cfps$log_tutor[!is.na(cfps$key_point)], y_tck1
+)
+mtext(c(paste("Figure 2. Partial Correlation between Tutoring and High School",
+    "(HS) Enrollment Odds Ratio"
+  ),
+  "      Tutoring (¥)",
+  "¥ is log(x+1) transformed",
+  "Odds ratio is log transformed"
+),
+side = 3,
+line = c(-2, -18, -18, -18),
+outer = T,
+adj = c(NA, NA, 0, 1),
+font = c(2, NA, NA, NA),
+cex = c(0.8, 0.8, 0.8, 0.8)
+)
+```
+
+```{r figure2_extra}
+# Calculating numbers used in text
+# Create fake rural and urban indivdiuals who differ only interms of residence,
+# the interaction term, and log_tutor. log_tutor takes 3 values 0, 275, 1000
+median(cfps$tutor[cfps$tutor > 0])
+fake6 <- fake[rep(1, 3), ]
+fake6[2, 1] <- log(275+1)
+fake6[3, 1] <- log(1000+1)
+fake6_rural <- fake6
+fake6_rural[, 2] <- "Rural"
+fake6_rural[2, 11] <- log(275+1)
+fake6_rural[3, 11] <- log(1000+1)
+fake6 <- fake6 %>% 
+  rbind(fake6_rural)
+# Calculate partial effect of 1000 yuan in models 2 and 8
+high_school6_band <- sim_bs(gam2, fake6, "s.") %>% 
+  band()
+exp(high_school6_band[[1]][3])
+exp(high_school6_band[[2]][3])
+exp(high_school6_band[[3]][3])
+key_point6_band <- sim_bs(gam8, fake6, "s.") %>% 
+  band()
+exp(key_point6_band[[1]][3])
+exp(key_point6_band[[2]][3])
+exp(key_point6_band[[3]][3])
+range <- max(xs_cfps)-min(xs_cfps)
+fake2 <- fake100[c(1, 100), ]
+# This function calculates the slope of almost-linear models in gam, and we can
+# use the slopes to calculate what happens if one doubles the amount of
+# spending.
+slopefinder <- function(model, term) {
+band <- sim_bs(model, fake2, term) %>% 
+  band()
+c(2 ^ ((band[[1]][2] - band[[1]][1]) / range),
+  2 ^ ((band[[2]][2] - band[[2]][1]) / range),
+  2 ^ ((band[[3]][2] - band[[3]][1]) / range))
+}
+slopefinder(gam2, "s.")
+slopefinder(gam8, "s.")
+# Calculate partial effect of 1000 yuan in models 6
+academic_high6_band5 <- sim_bs(gam5, fake6,"s.") %>% 
+  band()
+exp(academic_high6_band5[[1]][3])
+exp(academic_high6_band5[[2]][3])
+exp(academic_high6_band5[[3]][3])
+```
+
+
+``` {r figure3}
+# Create fake rural and urban indivdiuals who differ only interms of residence,
+# the interaction term, and log_tutor. log_tutor takes on a full range of
+# values so we can plot them
+fake100_rural <- fake[rep(1, 100), ] %>%
+  mutate(log_tutor = xs_cfps, interaction = xs_cfps)
+plot_both <- function(model, xlab, ylab, xs) {
+urban100_band <- sim_bs(model, fake100, "s.") %>%
+  band()
+rural100_band <- sim_bs(model, fake100_rural, "s.") %>%
+  band()
+plot(xs_cfps, urban100_band[[1]],
+  type = "l", ylim = c(-2, 8),
+  xlab = xlab, ylab = ylab,
+  xaxt = "n", yaxt = "n"
+)
+lines(xs_cfps, rural100_band[[1]], type = "l")
+# This function fills a confidence band with color
+polygons <- function(band, r, b) {
+  polygon(c(xs_cfps, rev(xs_cfps)), 
+  c(band[[3]], rev(band[[2]])
+),
+col = rgb(r, 0, b, max = 255, alpha = 128),
+border = NA
+)
+}
+polygons(urban100_band, 0, 255)
+polygons(rural100_band, 255, 0)
+axes(xs, y_tck1)
+}
+y_tck2 <- c(0.01, 0.1, 1, 10, 100)
+par(mfcol = c(2, 3))
+plots(gam3, fake100_rural, "interaction", "Tutoring (¥) * Rural", "HS",
+      c(-5, 5), cfps$interaction, y_tck2)
+plot_both(gam3, "Tutoring (¥)", "HS", cfps$log_tutor)
+plots(gam6, fake100_rural, "interaction", "Tutoring (¥) * Rural", "Academic HS",
+      c(-5, 5), cfps$interaction[!is.na(cfps$academic_high)], y_tck2)
+plot_both(gam6, "Tutoring (¥)", "Academic HS",
+  cfps$log_tutor[!is.na(cfps$high_school_type)]
+)
+plots(gam9, fake100_rural, "interaction", "Tutoring (¥) * Rural", "Key-point HS", c(-5, 5), cfps$interaction[!is.na(cfps$key_point)], y_tck2)
+plot_both(gam9, "Tutoring (¥)", "Key-point HS",
+  cfps$log_tutor[!is.na(cfps$key_point)]
+)
+mtext(c("Figure 3. Partial Correlation between Tutoring and High School (HS) Enrollment Odds Ratio, with Interactions",
+  "Rural Residence",
+  "Urban Residence",
+  "¥ is log(x+1) transformed",
+  "Odds ratio is log transformed"
+),
+side = 3,
+line = c(-2, -18, -18, -18, -18),
+outer = T,
+adj = c(NA, 0.4, 0.6, 0, 1),
+font = c(2, NA, NA, NA, NA),
+col = c("black", "red", "blue", "black", "black"),
+cex = c(0.8, 0.8, 0.8, 0.8, 0.8)
+)
+```
+
+```{r figure3_extra}
+# Calculating numbers used in text
+# This function finds the zeros of a curve
+zeros <- function(vector, xs) {
+  output <- NULL
+  for (i in 2:100) {
+    if (vector[i] * vector[i - 1] < 0) {
+      output <- output %>%
+        append(exp(xs[i]) - 1)
+    }
+  }
+  output
+}
+academic_high_interaction100_band <- sim_bs(gam6, 
+  fake100_rural,
+  "interaction"
+) %>%
+  band()
+interaction_gap <- zeros(academic_high_interaction100_band[[3]], xs_cfps)
+interaction_gap
+median(cfps$tutor[cfps$tutor > interaction_gap[1] &
+  cfps$tutor < interaction_gap[2]])
+# Value of interaction term at 275 yuan
+academic_high_interaction6_band <- sim_bs(gam6, fake6, "interaction") %>%
+  band()
+1 / exp(academic_high_interaction6_band[[1]][5])
+1 / exp(academic_high_interaction6_band[[2]][5])
+1 / exp(academic_high_interaction6_band[[3]][5])
+# Zeros in the relationship between tutoring and academic high school
+# enrollment for rural students
+academic_high_rural100_band <- sim_bs(
+  gam6, fake100_rural,
+  "s."
+) %>%
+  band()
+zeros(academic_high_rural100_band[[2]], xs_cfps)
+```
+
+```{r table3, results = "asis"}
+# This function is similar to sim_bs, but it doesn't calculate a partial effect
+# It also converts log odds results to probabilities and calculate a weighed
+# average for individuals in a dataset
+sim_bs_lite <- function(model, data, residence) {
+  data <- data[data$residence == residence, ]
+  set.seed(0)
+  preds <- tcrossprod(rmvn(10000, coef(model), model$Vp),
+    predict(model, newdata = data, type = "lpmatrix")
+  )
+  rowSums(exp(preds) / (exp(preds) + 1) * (data$wt / sum(data$wt)))
+}
+# This function reports the mean of a vector, with associated confidence
+# intervals
+neat <- function(sim) {
+  mean <- mean(sim)
+  lo <- quantile(sim, .025)
+  hi <- quantile(sim, .975)
+  paste0(format(round(100 * mean, 1), nsmall = 1), " (",
+    format(round(100 * lo, 1), nsmall = 1), ", ",
+    format(round(100 * hi, 1), nsmall = 1), ")"
+  )
+}
+# Predict enrollment rates for the data we have
+cfps_real2 <- filter(cfps, !is.na(wt))
+cfps_real6 <- filter(cfps, !is.na(wt) & !is.na(academic_high))
+cfps_real8 <- filter(cfps, !is.na(wt) & !is.na(key_point))
+urban_real2 <- sim_bs_lite(gam2, cfps_real2, "Urban")
+rural_real2 <- sim_bs_lite(gam2, cfps_real2, "Rural")
+gap_real2 <- urban_real2 - rural_real2
+urban_real6 <- sim_bs_lite(gam6, cfps_real6, "Urban")
+rural_real6 <- sim_bs_lite(gam6, cfps_real6, "Rural")
+gap_real6 <- urban_real6 - rural_real6
+urban_real8 <- sim_bs_lite(gam8, cfps_real8, "Urban")
+rural_real8 <- sim_bs_lite(gam8, cfps_real8, "Rural")
+gap_real8 <- urban_real8 - rural_real8
+# Predict enrollment rates if spending turns to zero
+cfps_zero2 <- mutate(cfps_real2, log_tutor = 0)
+cfps_zero6 <- mutate(cfps_real6, log_tutor = 0)
+cfps_zero8 <- mutate(cfps_real8, log_tutor = 0)
+rural_zero2 <- sim_bs_lite(gam2, cfps_zero2, "Rural")
+urban_zero2 <- sim_bs_lite(gam2, cfps_zero2, "Urban")
+gap_zero2 <- urban_zero2 - rural_zero2
+gap_gap2 <- gap_zero2 - gap_real2
+rural_zero6 <- sim_bs_lite(gam6, cfps_zero6, "Rural")
+urban_zero6 <- sim_bs_lite(gam6, cfps_zero6, "Urban")
+gap_zero6 <- urban_zero6 - rural_zero6
+gap_gap6 <- gap_zero6 - gap_real6
+rural_zero8 <- sim_bs_lite(gam8, cfps_zero8, "Rural")
+urban_zero8 <- sim_bs_lite(gam8, cfps_zero8, "Urban")
+gap_zero8 <- urban_zero8 - rural_zero8
+gap_gap8 <- gap_zero8 - gap_real8
+cbind(c("", "High School", "Academic High School", "Key-point High School"),
+  c("Rural (Before)", neat(rural_real2), neat(rural_real6), neat(rural_real8)),
+  c("Urban (Before)", neat(urban_real2), neat(urban_real6), neat(urban_real8)),
+  c("Gap (Before)", neat(gap_real2), neat(gap_real6), neat(gap_real8)),
+  c("Rural (After)", neat(rural_zero2), neat(rural_zero6), neat(rural_zero8)),
+  c("Urban (After)", neat(urban_zero2), neat(urban_zero6), neat(urban_zero8)),
+  c("Gap (After)", neat(gap_zero2), neat(gap_zero6), neat(gap_zero8)),
+  c("Gap Change", neat(gap_gap2), neat(gap_gap6), neat(gap_gap8))
+) %>%
+  kable(
+    caption = paste("Table 3. Weighted Naïve Estimate of Enrollment",
+      "Probabilities (%) as Private Tutoring Gets Banned"
+    ),
+    booktabs = T
+  )
+```
+
+```{r table3_extra}
+# actually calculate mean and confidence interval for gaps using the given real
+# data
+math_bs_gap <- function(data, outcome) {
+  urban <- data[data$residence == "Urban", ]
+  rural <- data[data$residence == "Rural", ]
+  urban_outcome <- outcome[data$residence == "Urban"]
+  rural_outcome <- outcome[data$residence == "Rural"]
+  urban_mean <- weighted.mean(urban_outcome, urban$wt)
+  urban_var <- urban_mean * (1 - urban_mean) * 
+    sum((urban$wt / sum(urban$wt)) ^ 2)
+  rural_mean <- weighted.mean(rural_outcome, rural$wt)
+  rural_var <- rural_mean * (1 - rural_mean) * 
+    sum((rural$wt / sum(rural$wt)) ^ 2)
+  half <- qt(0.975, nrow(data)) * sqrt(urban_var + rural_var)
+  gap <- urban_mean - rural_mean
+  c(gap, gap - half, gap + half)
+}
+math_bs_gap(cfps_real2, cfps_real2$high_school_num)
+math_bs_gap(cfps_real6, cfps_real6$academic_high_num)
+math_bs_gap(cfps_real8, cfps_real8$key_point_num)
+```
+
