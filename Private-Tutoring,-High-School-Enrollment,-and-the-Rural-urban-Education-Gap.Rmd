@@ -701,10 +701,6 @@ cfps <- rbind(group1, group2, group3) %>%
       T ~ as.character(academic_satisfaction)),
     female = ifelse(male == 0, "Yes", "No"),
     log_income = log(income),
-    log_income = case_when(is.na(log_income) ~ mean(log_income, na.rm = T),
-      T ~ log_income
-    ),
-    income000 = exp(log_income) / 1000,
     parent_edu = case_when(
       parent_edu == 1 ~ "Illiterate/Semi-literate",
       parent_edu == 2 ~ "Elementary School",
@@ -712,7 +708,6 @@ cfps <- rbind(group1, group2, group3) %>%
       parent_edu == 4 ~ "High School",
       parent_edu > 4 ~ "College or Above"
     ),
-    sibship = case_when(is.na(sibship) ~ mean(sibship, na.rm = T),T ~ sibship),
     region = case_when(
       province %in% c(11:13, 21, 31:33, 35, 37, 44, 46) ~ "Eastern",
       province %in% c(14, 22:23, 34, 36, 41:43) ~ "Central",
@@ -729,9 +724,12 @@ cfps <- rbind(group1, group2, group3) %>%
   merge(weights, "pid", all.x = T) %>%
   rename(wt = "rswt_nat") %>% 
   select(-pid)
-table(cfps$parent_edu)
-table(cfps$rural_hukou)
+summary(cfps)
 cfps <- mutate(cfps,
+  log_income = case_when(is.na(log_income) ~ mean(log_income, na.rm = T),
+      T ~ log_income
+    ),
+  income000 = exp(log_income) / 1000,
   parent_edu = case_when(is.na(parent_edu) ~ "Middle School", T ~ parent_edu),
   parent_edu = factor(parent_edu,
       levels = c("Illiterate/Semi-literate",
@@ -741,6 +739,7 @@ cfps <- mutate(cfps,
         "College or Above"
       )
     ),
+  sibship = case_when(is.na(sibship) ~ mean(sibship, na.rm = T),T ~ sibship),
   rural_hukou = case_when(is.na(rural_hukou) ~ "Yes", T ~ rural_hukou)
 )
 ```
